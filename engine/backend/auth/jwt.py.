@@ -1,0 +1,120 @@
+"""
+Bidimention (A-3) — JWT Authentication Module
+
+Responsibilities:
+- Issue JWTs for authenticated users
+- Decode & validate JWTs
+- Enforce expiration and session binding
+
+This module MUST NOT:
+- Talk to Google OAuth
+- Access Firestore directly
+- Perform trading logic
+"""
+
+from __future__ import annotations
+
+import os
+import time
+from dataclasses import dataclass
+from typing import Optional, Dict, Any
+
+import jwt
+from jwt import InvalidTokenError, ExpiredSignatureError
+
+
+# =====================================================
+# ENV CONFIG
+# =====================================================
+
+JWT_SECRET = os.getenv("JWT_SECRET", "")
+JWT_ISSUER = os.getenv("JWT_ISSUER", "bidimention")
+JWT_EXP_MINUTES = int(os.getenv("JWT_EXP_MINUTES", "1440"))  # default: 24h
+JWT_ALGORITHM = "HS256"
+
+if not JWT_SECRET:
+    raise RuntimeError("JWT_SECRET is not set")
+
+
+# =====================================================
+# DATA MODEL
+# =====================================================
+
+@dataclass(frozen=True)
+class JWTPayload:
+    uid: str
+    session_id: str
+    issued_at: int
+    expires_at: int
+
+
+# =====================================================
+# TOKEN ISSUANCE
+# =====================================================
+
+def issue_jwt(uid: str, session_id: str) -> str:
+    """
+    Issue a signed JWT for a user session.
+    """
+    now = int(time.time())
+    exp = now + JWT_EXP_MINUTES * 60
+
+    payload: Dict[str, Any] = {
+        "iss": JWT_ISSUER,
+        "sub": uid,
+        "sid": session_id,
+        "iat": now,
+        "exp": exp,
+    }
+
+    token = jwt.encode(
+        payload,
+        JWT_SECRET,
+        algorithm=JWT_ALGORITHM,
+    )
+
+    return token
+
+
+# =====================================================
+# TOKEN DECODING
+# =====================================================
+
+def decode_jwt(token: str) -> Optional[JWTPayload]:
+    """
+    Decode and validate a JWT.
+
+    Returns:
+        JWTPayload if valid
+        None if invalid / expired
+    """
+    try:
+        decoded = jwt.decode(
+            token,
+            JWT_SECRET,
+            algorithms=[JWT_ALGORITHM],
+            issuer=JWT_ISSUER,
+        )
+
+        return JWTPayload(
+            uid=decoded["sub"],
+            session_id=decoded["sid"],
+            issued_at=decoded["iat"],
+            expires_at=decoded["exp"],
+        )
+
+    except ExpiredSignatureError:
+        return None
+    except InvalidTokenError:
+        return None
+
+
+# =====================================================
+# UTILITY
+# =====================================================
+
+def is_token_expired(payload: JWTPayload) -> bool:
+    """
+    Explicit expiration check (defensive).
+    """
+    return int(time.time()) >= payload.expires_at
