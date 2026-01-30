@@ -5,6 +5,7 @@ Responsibilities:
 - Verify Google ID tokens issued to frontend
 - Enforce Gmail-only policy
 - Return normalized user identity
+- CONNECT identity to JWT issuer (Cognito)
 - NO session handling
 - NO JWT issuance
 """
@@ -26,9 +27,13 @@ logger = logging.getLogger("auth.google")
 # =====================================================
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+COGNITO_JWT_ISSUER = os.getenv("COGNITO_JWT_ISSUER")
 
 if not GOOGLE_CLIENT_ID:
     raise RuntimeError("GOOGLE_CLIENT_ID is not set")
+
+if not COGNITO_JWT_ISSUER:
+    raise RuntimeError("COGNITO_JWT_ISSUER is not set")
 
 # =====================================================
 # DATA MODEL
@@ -38,12 +43,15 @@ if not GOOGLE_CLIENT_ID:
 class GoogleUser:
     """
     Normalized Google identity payload
+    (issuer-connected, JWT-ready)
     """
     sub: str
     email: str
     email_verified: bool
     name: Optional[str]
     picture: Optional[str]
+    issuer: str        # downstream JWT issuer (Cognito)
+    provider: str      # explicit auth source
 
 
 # =====================================================
@@ -59,6 +67,7 @@ def validate_google_user(id_token_str: str) -> GoogleUser:
     2. Ensure email is verified
     3. Enforce Gmail-only policy
     4. Normalize identity
+    5. Attach JWT issuer context (Cognito)
 
     Raises:
         ValueError on invalid token
@@ -94,7 +103,7 @@ def validate_google_user(id_token_str: str) -> GoogleUser:
         raise ValueError("Only Gmail accounts are allowed")
 
     # -------------------------------------------------
-    # Build normalized identity
+    # Build normalized identity (issuer-connected)
     # -------------------------------------------------
 
     user = GoogleUser(
@@ -103,6 +112,8 @@ def validate_google_user(id_token_str: str) -> GoogleUser:
         email_verified=email_verified,
         name=payload.get("name"),
         picture=payload.get("picture"),
+        issuer=COGNITO_JWT_ISSUER,
+        provider="google",
     )
 
     logger.info(
@@ -110,6 +121,8 @@ def validate_google_user(id_token_str: str) -> GoogleUser:
         extra={
             "email": user.email,
             "sub": user.sub,
+            "issuer": user.issuer,
+            "provider": user.provider,
         },
     )
 
