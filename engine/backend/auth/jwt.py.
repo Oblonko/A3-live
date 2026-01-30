@@ -1,120 +1,125 @@
-"""
-Bidimention (A-3) — JWT Authentication Module
-
-Responsibilities:
-- Issue JWTs for authenticated users
-- Decode & validate JWTs
-- Enforce expiration and session binding
-
-This module MUST NOT:
-- Talk to Google OAuth
-- Access Firestore directly
-- Perform trading logic
-"""
-
-from __future__ import annotations
-
 import os
 import time
-from dataclasses import dataclass
-from typing import Optional, Dict, Any
+import json
+import httpx
+from typing import Dict, Any
 
-import jwt
-from jwt import InvalidTokenError, ExpiredSignatureError
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from jose import jwt, JWTError
 
-
-# =====================================================
+# =========================
 # ENV CONFIG
-# =====================================================
+# =========================
+COGNITO_ENABLED = os.getenv("COGNITO_ENABLED", "false").lower() == "true"
 
-JWT_SECRET = os.getenv("JWT_SECRET", "")
-JWT_ISSUER = os.getenv("JWT_ISSUER", "bidimention")
-JWT_EXP_MINUTES = int(os.getenv("JWT_EXP_MINUTES", "1440"))  # default: 24h
-JWT_ALGORITHM = "HS256"
+COGNITO_REGION = os.getenv("COGNITO_REGION")
+COGNITO_USER_POOL_ID = os.getenv("COGNITO_USER_POOL_ID")
+COGNITO_CLIENT_ID = os.getenv("COGNITO_CLIENT_ID")
 
-if not JWT_SECRET:
-    raise RuntimeError("JWT_SECRET is not set")
+COGNITO_JWT_ISSUER = os.getenv("COGNITO_JWT_ISSUER")
+COGNITO_JWT_ALGORITHM = os.getenv("COGNITO_JWT_ALGORITHM", "RS256")
+COGNITO_TOKEN_USE = os.getenv("COGNITO_TOKEN_USE", "access")
+
+# =========================
+# SECURITY
+# =========================
+security = HTTPBearer()
+
+# =========================
+# JWKS CACHE
+# =========================
+_JWKS_CACHE: Dict[str, Any] | None = None
+_JWKS_CACHE_TS: float = 0
+_JWKS_CACHE_TTL = 3600  # 1 hour
 
 
-# =====================================================
-# DATA MODEL
-# =====================================================
-
-@dataclass(frozen=True)
-class JWTPayload:
-    uid: str
-    session_id: str
-    issued_at: int
-    expires_at: int
-
-
-# =====================================================
-# TOKEN ISSUANCE
-# =====================================================
-
-def issue_jwt(uid: str, session_id: str) -> str:
-    """
-    Issue a signed JWT for a user session.
-    """
-    now = int(time.time())
-    exp = now + JWT_EXP_MINUTES * 60
-
-    payload: Dict[str, Any] = {
-        "iss": JWT_ISSUER,
-        "sub": uid,
-        "sid": session_id,
-        "iat": now,
-        "exp": exp,
-    }
-
-    token = jwt.encode(
-        payload,
-        JWT_SECRET,
-        algorithm=JWT_ALGORITHM,
+def _jwks_url() -> str:
+    return (
+        f"https://cognito-idp.{COGNITO_REGION}.amazonaws.com/"
+        f"{COGNITO_USER_POOL_ID}/.well-known/jwks.json"
     )
 
-    return token
+
+async def _get_jwks() -> Dict[str, Any]:
+    global _JWKS_CACHE, _JWKS_CACHE_TS
+
+    now = time.time()
+    if _JWKS_CACHE and (now - _JWKS_CACHE_TS) < _JWKS_CACHE_TTL:
+        return _JWKS_CACHE
+
+    async with httpx.AsyncClient(timeout=5) as client:
+        resp = await client.get(_jwks_url())
+        resp.raise_for_status()
+        _JWKS_CACHE = resp.json()
+        _JWKS_CACHE_TS = now
+        return _JWKS_CACHE
 
 
-# =====================================================
-# TOKEN DECODING
-# =====================================================
+# =========================
+# TOKEN VERIFICATION
+# =========================
+async def verify_cognito_token(token: str) -> Dict[str, Any]:
+    if not COGNITO_ENABLED:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Cognito authentication is disabled",
+        )
 
-def decode_jwt(token: str) -> Optional[JWTPayload]:
-    """
-    Decode and validate a JWT.
-
-    Returns:
-        JWTPayload if valid
-        None if invalid / expired
-    """
     try:
-        decoded = jwt.decode(
+        unverified_header = jwt.get_unverified_header(token)
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid JWT header",
+        )
+
+    jwks = await _get_jwks()
+
+    key = next(
+        (k for k in jwks["keys"] if k["kid"] == unverified_header["kid"]),
+        None,
+    )
+
+    if not key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="JWT public key not found",
+        )
+
+    try:
+        payload = jwt.decode(
             token,
-            JWT_SECRET,
-            algorithms=[JWT_ALGORITHM],
-            issuer=JWT_ISSUER,
+            key,
+            algorithms=[COGNITO_JWT_ALGORITHM],
+            issuer=COGNITO_JWT_ISSUER,
+            options={
+                "verify_aud": False,  # access tokens don't require aud
+            },
+        )
+    except JWTError as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Token verification failed: {str(e)}",
         )
 
-        return JWTPayload(
-            uid=decoded["sub"],
-            session_id=decoded["sid"],
-            issued_at=decoded["iat"],
-            expires_at=decoded["exp"],
+    # =========================
+    # Cognito-specific checks
+    # =========================
+    if payload.get("token_use") != COGNITO_TOKEN_USE:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token_use",
         )
 
-    except ExpiredSignatureError:
-        return None
-    except InvalidTokenError:
-        return None
+    return payload
 
 
-# =====================================================
-# UTILITY
-# =====================================================
-
-def is_token_expired(payload: JWTPayload) -> bool:
-    """
-    Explicit expiration check (defensive).
-    """
-    return int(time.time()) >= payload.expires_at
+# =========================
+# FASTAPI DEPENDENCY
+# =========================
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> Dict[str, Any]:
+    token = credentials.credentials
+    return await verify_cognito_token(token)
